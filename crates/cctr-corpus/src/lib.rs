@@ -379,8 +379,23 @@ fn blank_line(input: &mut &str) -> ModalResult<()> {
         .parse_next(input)
 }
 
-fn skip_blank_lines(input: &mut &str) -> ModalResult<()> {
-    repeat(0.., blank_line)
+/// A comment line: optional leading spaces, then `#`, to end of line.
+///
+/// cctr's corpus format historically had no comment syntax, so a `#` header or
+/// an inline `#` note silently truncated a file's tests: the test loop stopped
+/// at the first line that was not `===`/a directive and the file parsed to zero
+/// tests with no error. Comments are now consumed wherever blank lines are.
+fn comment_line(input: &mut &str) -> ModalResult<()> {
+    take_while(0.., ' ').parse_next(input)?;
+    '#'.parse_next(input)?;
+    line_content.parse_next(input)?;
+    opt_newline.parse_next(input)?;
+    Ok(())
+}
+
+/// Skip blank lines and `#` comment lines.
+fn skip_ignorable_lines(input: &mut &str) -> ModalResult<()> {
+    repeat(0.., alt((blank_line, comment_line)))
         .map(|_: Vec<()>| ())
         .parse_next(input)
 }
@@ -555,7 +570,7 @@ fn where_section(input: &mut &str, delimiter_len: usize) -> ModalResult<Vec<Stri
 fn test_case(state: &mut ParseState) -> Result<TestCase, winnow::error::ErrMode<ContextError>> {
     let input = &mut state.input;
 
-    skip_blank_lines.parse_next(input)?;
+    skip_ignorable_lines.parse_next(input)?;
 
     let start_line = state.current_line;
 
@@ -633,7 +648,7 @@ fn test_case(state: &mut ParseState) -> Result<TestCase, winnow::error::ErrMode<
         state.current_line += 2 + constraints.len();
     }
 
-    skip_blank_lines.parse_next(input)?;
+    skip_ignorable_lines.parse_next(input)?;
 
     let end_line = state.current_line;
 
@@ -657,7 +672,7 @@ fn test_case(state: &mut ParseState) -> Result<TestCase, winnow::error::ErrMode<
 fn corpus_file(state: &mut ParseState) -> Result<CorpusFile, winnow::error::ErrMode<ContextError>> {
     let input = &mut state.input;
 
-    skip_blank_lines.parse_next(input)?;
+    skip_ignorable_lines.parse_next(input)?;
 
     // Parse file-level directives (skip, shell, platform can appear in any order)
     let mut file_skip = None;
@@ -669,15 +684,15 @@ fn corpus_file(state: &mut ParseState) -> Result<CorpusFile, winnow::error::ErrM
         if input.starts_with("%skip") && file_skip.is_none() {
             file_skip = Some(skip_directive.parse_next(input)?);
             state.current_line += 1;
-            skip_blank_lines.parse_next(input)?;
+            skip_ignorable_lines.parse_next(input)?;
         } else if input.starts_with("%shell") && file_shell.is_none() {
             file_shell = Some(shell_directive.parse_next(input)?);
             state.current_line += 1;
-            skip_blank_lines.parse_next(input)?;
+            skip_ignorable_lines.parse_next(input)?;
         } else if input.starts_with("%platform") && file_platform.is_empty() {
             file_platform = platform_directive.parse_next(input)?;
             state.current_line += 1;
-            skip_blank_lines.parse_next(input)?;
+            skip_ignorable_lines.parse_next(input)?;
         } else {
             break;
         }
@@ -685,14 +700,25 @@ fn corpus_file(state: &mut ParseState) -> Result<CorpusFile, winnow::error::ErrM
 
     let mut tests = Vec::new();
 
-    while !state.input.is_empty() {
-        let peeked = state.input.trim_start();
-        if peeked.is_empty() {
+    loop {
+        // Skip blank lines and `#` comments so a comment block before or
+        // between tests never truncates the file.
+        skip_ignorable_lines.parse_next(&mut state.input)?;
+
+        if state.input.is_empty() {
             break;
         }
 
-        if !peeked.starts_with("===") {
-            break;
+        // Anything that is not a test block here is unexpected content. Fail
+        // loudly rather than silently dropping the rest of the file — before
+        // this, a `#` line at the top produced a file with zero tests and no
+        // error at all.
+        if !state.input.starts_with("===") {
+            state.error_message = Some(format!(
+                "unexpected content (expected a '===' test block or a %directive): `{}`",
+                state.input.lines().next().unwrap_or("").trim()
+            ));
+            return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
         }
 
         let tc = test_case(state)?;
@@ -715,6 +741,101 @@ mod tests {
 
     fn parse_test(content: &str) -> CorpusFile {
         parse_content(content, Path::new("<test>")).unwrap()
+    }
+
+    #[test]
+    fn test_parse_leading_comment_lines() {
+        // Regression: a `#` header used to make the file parse to zero tests.
+        let content = r#"# header comment
+# second comment line
+
+===
+real test
+===
+echo hi
+---
+hi
+"#;
+        let file = parse_test(content);
+        assert_eq!(file.tests.len(), 1);
+        assert_eq!(file.tests[0].name, "real test");
+        assert_eq!(file.tests[0].command, "echo hi");
+    }
+
+    #[test]
+    fn test_parse_comment_between_tests() {
+        // Regression: a `#` line between tests used to truncate the rest.
+        let content = r#"===
+first
+===
+echo a
+---
+a
+
+# a note between tests
+
+===
+second
+===
+echo b
+---
+b
+"#;
+        let file = parse_test(content);
+        assert_eq!(file.tests.len(), 2);
+        assert_eq!(file.tests[0].name, "first");
+        assert_eq!(file.tests[1].name, "second");
+    }
+
+    #[test]
+    fn test_parse_trailing_comment() {
+        let content = r#"===
+only test
+===
+true
+---
+
+# trailing note
+"#;
+        let file = parse_test(content);
+        assert_eq!(file.tests.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_comment_before_file_directive() {
+        let content = r#"# header
+
+%skip(needs a feature) if: false
+
+===
+runs
+===
+true
+---
+"#;
+        let file = parse_test(content);
+        assert_eq!(file.tests.len(), 1);
+        assert!(file.file_skip.is_some());
+    }
+
+    #[test]
+    fn test_parse_rejects_unexpected_content() {
+        // Unconsumed, non-comment, non-`===` content must be a loud parse error
+        // (it used to be silently dropped).
+        let content = r#"garbage line
+
+===
+t
+===
+true
+---
+"#;
+        let err = parse_content(content, Path::new("<test>")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unexpected content"),
+            "expected an 'unexpected content' parse error, got: {msg}"
+        );
     }
 
     #[test]

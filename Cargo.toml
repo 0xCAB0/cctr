@@ -3,16 +3,16 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.31.0"
+version = "0.31.0-paso4.1"
 edition = "2021"
 authors = ["Andreas Jansson"]
 license = "MIT"
-homepage = "https://github.com/andreasjansson/cctr"
-repository = "https://github.com/andreasjansson/cctr"
+homepage = "https://github.com/0xCAB0/cctr"
+repository = "https://github.com/0xCAB0/cctr"
 
 [workspace.dependencies]
-cctr-expr = { version = "0.31.0", path = "crates/cctr-expr" }
-cctr-corpus = { version = "0.31.0", path = "crates/cctr-corpus" }
+cctr-expr = { version = "0.31.0-paso4.1", path = "crates/cctr-expr" }
+cctr-corpus = { version = "0.31.0-paso4.1", path = "crates/cctr-corpus" }
 
 [profile.release]
 lto = true
