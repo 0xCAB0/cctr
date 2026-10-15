@@ -406,6 +406,15 @@ fn is_any_separator_line(line: &str) -> bool {
         || (trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-'))
 }
 
+/// Whether the next line is a dash separator exactly `len` characters long —
+/// the optional per-test closing `---` some corpus files include.
+fn next_line_is_dash_sep(input: &str, len: usize) -> bool {
+    input.lines().next().is_some_and(|line| {
+        let trimmed = line.trim();
+        trimmed.len() == len && trimmed.chars().all(|c| c == '-')
+    })
+}
+
 // ============ Skip Directive Parser ============
 
 fn skip_message(input: &mut &str) -> ModalResult<String> {
@@ -646,6 +655,13 @@ fn test_case(state: &mut ParseState) -> Result<TestCase, winnow::error::ErrMode<
         .unwrap_or_default();
     if !constraints.is_empty() {
         state.current_line += 2 + constraints.len();
+    } else if next_line_is_dash_sep(input, delimiter_len) {
+        // Some corpus files close a test with an extra `---` even when there is
+        // no `where` section. Consume it so it does not leak to the top level,
+        // where it used to silently truncate the rest of the file.
+        dash_sep_exact(input, delimiter_len)?;
+        opt_newline.parse_next(input)?;
+        state.current_line += 1;
     }
 
     skip_ignorable_lines.parse_next(input)?;
@@ -836,6 +852,33 @@ true
             msg.contains("unexpected content"),
             "expected an 'unexpected content' parse error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_parse_closing_dash_without_where() {
+        // Some corpus files close each test with an extra `---` (no `where`
+        // section). It used to leak to the top level and silently truncate the
+        // rest of the file.
+        let content = r#"===
+first
+===
+echo a
+---
+a
+---
+===
+second
+===
+echo b
+---
+b
+---
+"#;
+        let file = parse_test(content);
+        assert_eq!(file.tests.len(), 2);
+        assert_eq!(file.tests[0].name, "first");
+        assert_eq!(file.tests[1].name, "second");
+        assert_eq!(file.tests[1].expected_output, "b");
     }
 
     #[test]
